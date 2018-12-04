@@ -30,12 +30,28 @@ extension BuildSystemList: BuildSystem {
 
   public var indexDatabasePath: AbsolutePath? { return providers.first?.indexDatabasePath }
 
-  public func settings(for url: URL, _ language: Language) -> FileBuildSettings? {
-    for provider in providers {
-      if let settings = provider.settings(for: url, language) {
-        return settings
+  public func settings(
+    for url: URL, 
+    _ language: Language, 
+    _ completion: @escaping (URL, Language, FileBuildSettings?) -> Void)
+  {
+    precondition(!providers.isEmpty)
+
+    var providers = self.providers[...]
+    var continuation: ((URL, Language, FileBuildSettings?) -> Void)? = nil
+    continuation = { (url: URL, language: Language, settings: FileBuildSettings?) -> Void in
+      if let settings = settings {
+        return completion(url, language, settings)
       }
+      // Try the next provider.
+      if let provider = providers.popFirst() {
+        return provider.settings(for: url, language, continuation!)
+      }
+      // Failed to find any settings.
+      completion(url, language, nil)
     }
-    return nil
+
+    // Start the chain. Passing nil triggers looking at the first provider.
+    continuation!(url, language, nil)
   }
 }

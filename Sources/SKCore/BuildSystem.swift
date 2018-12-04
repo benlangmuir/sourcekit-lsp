@@ -29,8 +29,16 @@ public protocol BuildSystem {
   /// The path to put the index database, if any.
   var indexDatabasePath: AbsolutePath? { get }
 
-  /// Returns the settings for the given url and language mode, if known.
-  func settings(for: URL, _ language: Language) -> FileBuildSettings?
+  /// Provides the settings for the given url and language mode via callback.
+  ///
+  /// - parameters:
+  ///   - url: The document whose settings to retrieve.
+  ///   - language: The language (swift, c++, etc.) of the file.
+  ///   - completion: Called asynchronously with the appropriate FileBuildSettings, or nil.
+  func settings(
+    for url: URL, 
+    _ language: Language, 
+    _ completion: @escaping (URL, Language, FileBuildSettings?) -> Void)
 
   // TODO: notifications when settings change.
 }

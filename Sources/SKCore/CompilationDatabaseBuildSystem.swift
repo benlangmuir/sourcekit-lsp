@@ -12,6 +12,7 @@
 
 import Basic
 import LanguageServerProtocol
+import Dispatch
 
 /// A `BuildSystem` based on loading clang-compatible compilation database(s).
 ///
@@ -22,7 +23,12 @@ public final class CompilationDatabaseBuildSystem {
   /// The compilation database.
   var compdb: CompilationDatabase? = nil
 
+  /// The FileSystem to use for reading compilation database files.
   let fileSystem: FileSystem
+
+  /// DispatchQueue used to execute queries asynchronously.
+  let queue: DispatchQueue =
+    DispatchQueue(label: "\(CompilationDatabaseBuildSystem.self)", qos: .utility)
 
   public init(projectRoot: AbsolutePath? = nil, fileSystem: FileSystem = localFileSystem) {
     self.fileSystem = fileSystem
@@ -38,14 +44,21 @@ extension CompilationDatabaseBuildSystem: BuildSystem {
   public var indexStorePath: AbsolutePath? { return nil }
   public var indexDatabasePath: AbsolutePath? { return nil }
 
-  public func settings(for url: URL, _ language: Language) -> FileBuildSettings? {
-    guard let db = database(for: url),
-          let cmd = db[url].first else { return nil }
-    return FileBuildSettings(
-      preferredToolchain: nil, // FIXME: infer from path
-      compilerArguments: Array(cmd.commandLine.dropFirst()),
-      workingDirectory: cmd.directory
-    )
+  public func settings(
+    for url: URL, 
+    _ language: Language, 
+    _ completion: @escaping (URL, Language, FileBuildSettings?) -> Void)
+  {
+    queue.async {
+      var settings: FileBuildSettings? = nil
+      if let db = self.database(for: url), let cmd = db[url].first { 
+        settings = FileBuildSettings(
+          preferredToolchain: nil, // FIXME: infer from path
+          compilerArguments: Array(cmd.commandLine.dropFirst()),
+          workingDirectory: cmd.directory)
+      }
+      completion(url, language, settings)
+    }
   }
 
   func database(for url: URL) -> CompilationDatabase? {

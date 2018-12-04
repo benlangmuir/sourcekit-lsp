@@ -13,9 +13,10 @@
 import LanguageServerProtocol
 import Basic
 import enum Utility.Platform
+import Dispatch
 
 /// A simple BuildSystem suitable as a fallback when accurate settings are unknown.
-public final class FallbackBuildSystem: BuildSystem {
+public final class FallbackBuildSystem {
 
   /// The path to the SDK.
   lazy var sdkpath: AbsolutePath? = {
@@ -29,22 +30,33 @@ public final class FallbackBuildSystem: BuildSystem {
     return nil
   }()
 
-  public var indexStorePath: AbsolutePath? { return nil }
+  /// DispatchQueue used to execute queries asynchronously.
+  let queue: DispatchQueue = DispatchQueue(label: "\(FallbackBuildSystem.self)", qos: .utility)
+}
 
+extension FallbackBuildSystem: BuildSystem {
+  public var indexStorePath: AbsolutePath? { return nil }
   public var indexDatabasePath: AbsolutePath? { return nil }
 
-  public func settings(for url: URL, _ language: Language) -> FileBuildSettings? {
-    guard let path = try? AbsolutePath(validating: url.path) else {
-      return nil
-    }
+  public func settings(
+    for url: URL, 
+    _ language: Language, 
+    _ completion: @escaping (URL, Language, FileBuildSettings?) -> Void)
+  {
+    queue.async {
+      guard let path = try? AbsolutePath(validating: url.path) else {
+        completion(url, language, nil)
+        return
+      }
 
-    switch language {
-    case .swift:
-      return settingsSwift(path)
-    case .c, .cpp, .objective_c, .objective_cpp:
-      return settingsClang(path, language)
-    default:
-      return nil
+      switch language {
+      case .swift:
+        completion(url, language, self.settingsSwift(path))
+      case .c, .cpp, .objective_c, .objective_cpp:
+        completion(url, language, self.settingsClang(path, language))
+      default:
+        completion(url, language, nil)
+      }
     }
   }
 

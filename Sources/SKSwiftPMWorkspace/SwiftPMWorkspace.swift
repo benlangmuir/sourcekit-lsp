@@ -20,6 +20,7 @@ import PackageModel
 import PackageGraph
 import PackageLoading
 import Workspace
+import Dispatch
 
 public final class SwiftPMWorkspace {
 
@@ -37,13 +38,16 @@ public final class SwiftPMWorkspace {
   let toolchainRegistry: ToolchainRegistry
   let fs: FileSystem
 
+  /// DispatchQueue used to execute queries asynchronously.
+  let queue: DispatchQueue = DispatchQueue(label: "\(SwiftPMWorkspace.self)", qos: .utility)
+
   var fileToTarget: [AbsolutePath: TargetBuildDescription] = [:]
   var sourceDirToTarget: [AbsolutePath: TargetBuildDescription] = [:]
 
   /// Creates a `BuildSystem` using the Swift Package Manager, if this workspace is part of a package.
   ///
   /// - returns: nil if `workspacePath` is not part of a package or there is an error.
-  public convenience init?(url: LanguageServerProtocol.URL, toolchainRegistry: ToolchainRegistry) {
+  public convenience init?(url: URL, toolchainRegistry: ToolchainRegistry) {
     do {
       try self.init(workspacePath: try AbsolutePath(validating: url.path), toolchainRegistry: toolchainRegistry, fileSystem: localFileSystem)
     } catch {
@@ -177,26 +181,31 @@ extension SwiftPMWorkspace: BuildSystem {
   }
 
   public func settings(
-    for url: LanguageServerProtocol.URL,
-    _ language: Language) -> FileBuildSettings?
+    for url: URL, 
+    _ language: Language, 
+    _ completion: @escaping (URL, Language, FileBuildSettings?) -> Void)
   {
-    guard let path = try? AbsolutePath(validating: url.path) else {
-      return nil
-    }
+    queue.async {
+      guard let path = try? AbsolutePath(validating: url.path) else {
+        return completion(url, language, nil)
+      }
 
-    if let td = self.fileToTarget[path] {
-      return settings(for: path, language, td)
-    }
+      var settings: FileBuildSettings? = nil
 
-    if path.basename == "Package.swift" {
-      return packageDescriptionSettings(path)
-    }
+      if let td = self.fileToTarget[path] {
+        settings = self.settings(for: path, language, td)
+      }
 
-    if path.extension == "h" {
-      return settings(forHeader: path, language)
-    }
+      if path.basename == "Package.swift" {
+        settings = self.packageDescriptionSettings(path)
+      }
 
-    return nil
+      if path.extension == "h" {
+        settings = self.settings(forHeader: path, language)
+      }
+
+      completion(url, language, settings)
+    }
   }
 }
 
@@ -400,3 +409,6 @@ public final class BuildSettingProviderWorkspaceDelegate: WorkspaceDelegate {
   public func managedDependenciesDidUpdate(_ dependencies: AnySequence<ManagedDependency>) {
   }
 }
+
+/// Alias for LanguageServerProtocol.URL to workaround ambiguity.
+public typealias URL = LanguageServerProtocol.URL
