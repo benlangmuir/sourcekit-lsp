@@ -32,7 +32,7 @@ let package = Package(
         dependencies: ["SourceKit"]),
       .testTarget(
         name: "SourceKitTests",
-        dependencies: ["SourceKit", "SKTestSupport"]),
+        dependencies: ["SourceKit", "SKTestSupport", "ISDBTestSupport"]),
 
       .target(
         name: "SKSwiftPMWorkspace",
