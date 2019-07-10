@@ -84,6 +84,7 @@ public final class SKTibsWorkspace {
 
   public static let defaultToolchain = TibsToolchain(
     swiftc: findTool(name: "swiftc")!,
+    clang: findTool(name: "clang")!,
     ninja: findTool(name: "ninja"))
 
   public var sources: TestSources
