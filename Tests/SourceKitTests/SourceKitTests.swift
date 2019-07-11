@@ -17,6 +17,7 @@ import SPMUtility
 import SKCore
 import SKTestSupport
 import IndexStoreDB
+import ISDBTibs
 import ISDBTestSupport
 import XCTest
 
@@ -85,6 +86,7 @@ public final class SKTibsWorkspace {
   public static let defaultToolchain = TibsToolchain(
     swiftc: findTool(name: "swiftc")!,
     clang: findTool(name: "clang")!,
+    tibs: XCTestCase.productsDirectory.appendingPathComponent("tibs"),
     ninja: findTool(name: "ninja"))
 
   public var sources: TestSources
@@ -158,7 +160,7 @@ extension XCTestCase {
     let testDirName = testDirectoryName
     return try SKTibsWorkspace(
       projectDir: inputsDirectory(testFile: testFile).appendingPathComponent(name),
-      buildDir: productsDirectory
+      buildDir: XCTestCase.productsDirectory
         .appendingPathComponent("sk-tests")
         .appendingPathComponent(testDirName),
       tmpDir: URL(fileURLWithPath: NSTemporaryDirectory())
