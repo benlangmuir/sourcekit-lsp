@@ -62,22 +62,48 @@ final class SKTests: XCTestCase {
     }
 
   func testIndex() throws {
-    let ws = try skTibsWorkspace(name: "proj1")
+    let ws = try skTibsWorkspace(name: "SwiftModules")
     try ws.buildAndIndex()
 
-    let curl = ws.testLoc("c:call").url
+    let locDef = ws.testLoc("aaa:def")
+    let locRef = ws.testLoc("aaa:call:c")
     ws.sk.send(DidOpenTextDocument(textDocument: TextDocumentItem(
-      url: curl,
+      url: locRef.url,
       language: .swift,
       version: 1,
-      text: try ws.sources.sourceCache.get(curl))))
+      text: try ws.sources.sourceCache.get(locRef.url))))
 
-    let result = try ws.sk.sendSync(ReferencesRequest(
-      textDocument: TextDocumentIdentifier(curl), position: Position(line: ws.testLoc("c:call").line - 1, utf16index: ws.testLoc("c:call").column - 1)))
-    // FIXME: utf8 vs utf16 column
+    // MARK: Jump to definition
 
-    XCTAssertEqual(2, result.count)
+    let jump = try ws.sk.sendSync(DefinitionRequest(
+      textDocument: TextDocumentIdentifier(locRef.url),
+      position: locRef.position))
 
+    XCTAssertEqual(jump.count, 1)
+    XCTAssertEqual(jump.first?.url, locDef.url)
+    XCTAssertEqual(jump.first?.range.lowerBound, locDef.position)
+
+    // MARK: Find references
+
+    ws.sk.send(DidOpenTextDocument(textDocument: TextDocumentItem(
+      url: locDef.url,
+      language: .swift,
+      version: 1,
+      text: try ws.sources.sourceCache.get(locDef.url))))
+
+    let refs = try ws.sk.sendSync(ReferencesRequest(
+      textDocument: TextDocumentIdentifier(locDef.url),
+      position: locDef.position))
+
+    XCTAssertEqual(3, refs.count)
+  }
+
+}
+
+extension TestLoc {
+  public var position: Position {
+    // FIXME: utf16 vfs utf8 column
+    Position(line: line - 1, utf16index: column - 1)
   }
 }
 
