@@ -29,10 +29,10 @@ let package = Package(
 
       .target(
         name: "SKTestSupport",
-        dependencies: ["SourceKit"]),
+        dependencies: ["SourceKit", "ISDBTestSupport"]),
       .testTarget(
         name: "SourceKitTests",
-        dependencies: ["SourceKit", "SKTestSupport", "ISDBTestSupport"]),
+        dependencies: ["SourceKit", "SKTestSupport"]),
 
       .target(
         name: "SKSwiftPMWorkspace",
