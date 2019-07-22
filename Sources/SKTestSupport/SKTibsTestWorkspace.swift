@@ -72,7 +72,7 @@ public final class SKTibsTestWorkspace {
 
 extension SKTibsTestWorkspace {
 
-  public func testLoc(_ name: String) -> TestLoc { sources.locations[name]! }
+  public func testLoc(_ name: String) -> TestLocation { sources.locations[name]! }
 
   public func buildAndIndex() throws {
     try tibsWorkspace.buildAndIndex()
@@ -113,21 +113,21 @@ extension XCTestCase {
   }
 }
 
-extension TestLoc {
+extension TestLocation {
   public var position: Position {
     Position(self)
   }
 }
 
 extension Position {
-  public init(_ loc: TestLoc) {
+  public init(_ loc: TestLocation) {
     // FIXME: utf16 vfs utf8 column
     self.init(line: loc.line - 1, utf16index: loc.column - 1)
   }
 }
 
 extension Location {
-  public init(_ loc: TestLoc) {
+  public init(_ loc: TestLocation) {
     self.init(url: loc.url, range: Range(Position(loc)))
   }
 }
@@ -149,6 +149,6 @@ extension TibsToolchain {
   }
 }
 
-extension TestLoc {
+extension TestLocation {
   public var docIdentifier: TextDocumentIdentifier { TextDocumentIdentifier(url) }
 }
