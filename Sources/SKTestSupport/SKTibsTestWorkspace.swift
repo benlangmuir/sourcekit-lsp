@@ -134,12 +134,18 @@ extension Location {
 
 extension TibsToolchain {
   public convenience init(_ sktc: Toolchain) {
+    let ninja: URL?
+    if let ninjaPath = ProcessInfo.processInfo.environment["NINJA_BIN"] {
+      ninja = URL(fileURLWithPath: ninjaPath, isDirectory: false)
+    } else {
+      ninja = findTool(name: "ninja")
+    }
     self.init(
       swiftc: sktc.swiftc!.asURL,
       clang: sktc.clang!.asURL,
       libIndexStore: sktc.libIndexStore!.asURL,
       tibs: XCTestCase.productsDirectory.appendingPathComponent("tibs", isDirectory: false),
-      ninja: findTool(name: "ninja"))
+      ninja: ninja)
   }
 }
 
