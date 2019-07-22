@@ -23,7 +23,7 @@ import Foundation
 
 public typealias URL = Foundation.URL
 
-public final class SKTibsWorkspace {
+public final class SKTibsTestWorkspace {
 
   public let tibsWorkspace: TibsTestWorkspace
   public let testServer = TestSourceKitServer(connectionKind: .local)
@@ -70,7 +70,7 @@ public final class SKTibsWorkspace {
   }
 }
 
-extension SKTibsWorkspace {
+extension SKTibsTestWorkspace {
 
   public func testLoc(_ name: String) -> TestLoc { sources.locations[name]! }
 
@@ -79,7 +79,7 @@ extension SKTibsWorkspace {
   }
 }
 
-extension SKTibsWorkspace {
+extension SKTibsTestWorkspace {
   public func openDocument(_ url: URL, language: Language) throws {
     sk.send(DidOpenTextDocument(textDocument: TextDocumentItem(
       url: url,
@@ -91,9 +91,9 @@ extension SKTibsWorkspace {
 
 extension XCTestCase {
 
-  public func staticSourceKitTibsWorkspace(name: String, testFile: String = #file) throws -> SKTibsWorkspace? {
+  public func staticSourceKitTibsWorkspace(name: String, testFile: String = #file) throws -> SKTibsTestWorkspace? {
     let testDirName = testDirectoryName
-    let workspace = try SKTibsWorkspace(
+    let workspace = try SKTibsTestWorkspace(
       immutableProjectDir: inputsDirectory(testFile: testFile)
         .appendingPathComponent(name, isDirectory: true),
       persistentBuildDir: XCTestCase.productsDirectory
