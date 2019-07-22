@@ -61,7 +61,7 @@ final class SKTests: XCTestCase {
       XCTAssertNotNil(initResult.capabilities.completionProvider)
     }
 
-  func testIndex() throws {
+  func testIndexSwiftModules() throws {
     guard let ws = try staticSourceKitTibsWorkspace(name: "SwiftModules") else { return }
     try ws.buildAndIndex()
 
@@ -87,6 +87,42 @@ final class SKTests: XCTestCase {
       textDocument: locDef.docIdentifier,
       position: locDef.position))
 
-    XCTAssertEqual(3, refs.count)
+    XCTAssertEqual(Set(refs), [
+      Location(locDef),
+      Location(locRef),
+      Location(ws.testLoc("aaa:call")),
+    ])
+  }
+
+  func testCodeCompleteSwiftTibs() throws {
+    guard let ws = try staticSourceKitTibsWorkspace(name: "CodeCompleteSingleModule") else { return }
+    let loc = ws.testLoc("cc:A")
+    try ws.openDocument(loc.url, language: .swift)
+
+    let results = try ws.sk.sendSync(
+      CompletionRequest(textDocument: loc.docIdentifier, position: loc.position))
+
+    XCTAssertEqual(results, CompletionList(isIncomplete: false, items: [
+      CompletionItem(
+        label: "method(a: Int)",
+        detail: "Void",
+        sortText: nil,
+        filterText: "method(a:)",
+        textEdit: nil,
+        insertText: "method(a: ${1:value})",
+        insertTextFormat: .snippet,
+        kind: .method,
+        deprecated: nil),
+      CompletionItem(
+        label: "self",
+        detail: "A",
+        sortText: nil,
+        filterText: "self",
+        textEdit: nil,
+        insertText: "self",
+        insertTextFormat: .snippet,
+        kind: .keyword,
+        deprecated: nil),
+    ]))
   }
 }

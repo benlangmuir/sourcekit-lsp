@@ -126,6 +126,12 @@ extension Position {
   }
 }
 
+extension Location {
+  public init(_ loc: TestLoc) {
+    self.init(url: loc.url, range: Range(Position(loc)))
+  }
+}
+
 extension TibsToolchain {
   public convenience init(_ sktc: Toolchain) {
     self.init(
