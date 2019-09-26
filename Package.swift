@@ -7,7 +7,13 @@ let package = Package(
     products: [
     ],
     dependencies: [
-      // See 'Dependencies' below.
+
+      // FIXME: use versioned NIO dependency
+      .package(url: "https://github.com/weissi/swift-nio.git", .branch("jw-pipe-channel")),
+      .package(url: "https://github.com/apple/swift-nio-extras.git", from: "1.2.0"),
+
+
+      // See 'Toolchain Dependencies' below for additional dependencies.
     ],
     targets: [
       .target(
@@ -59,7 +65,7 @@ let package = Package(
       // jsonrpc: LSP connection using jsonrpc over pipes.
       .target(
         name: "LanguageServerProtocolJSONRPC",
-        dependencies: ["LanguageServerProtocol"]),
+        dependencies: ["LanguageServerProtocol", "NIO", "NIOFoundationCompat", "NIOExtras"]),
       .testTarget(
         name: "LanguageServerProtocolJSONRPCTests",
         dependencies: ["LanguageServerProtocolJSONRPC", "SKTestSupport"]),

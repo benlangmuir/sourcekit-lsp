@@ -14,17 +14,173 @@ import SKSupport
 import LanguageServerProtocol
 import Dispatch
 import Foundation
+import NIO
+import NIOExtras
+import NIOFoundationCompat
+
+struct OutstandingRequest {
+  var promise: EventLoopPromise<LSPResult<Any>>
+  var responseType: ResponseType.Type
+}
+
+final class JSONRPCConnectionBridge {
+
+  let messageHandler: (JSONRPCMessage) -> Void
+  let errorHandler: (Error) -> Void
+  let handlerQueue: DispatchQueue
+  var scratchBuffer: ByteBuffer! = nil
+  let jsonEncoder: JSONEncoder = JSONEncoder()
+  let jsonDecoder: JSONDecoder
+  var outstandingRequests: [RequestID: OutstandingRequest] = [:]
+
+  init(
+    `protocol` messageRegistry: MessageRegistry,
+    messageHandler: @escaping (JSONRPCMessage) -> Void,
+    errorHandler: @escaping (Error) -> Void,
+    handlerQueue: DispatchQueue)
+  {
+    self.messageHandler = messageHandler
+    self.errorHandler = errorHandler
+    self.handlerQueue = handlerQueue
+    self.jsonDecoder = JSONDecoder()
+    jsonDecoder.userInfo[.messageRegistryKey] = messageRegistry
+  }
+}
+
+extension JSONRPCConnectionBridge: ChannelDuplexHandler {
+
+  typealias InboundIn = ByteBuffer
+  typealias InbountOut = JSONRPCMessage
+  typealias OutboundIn = (JSONRPCMessage, OutstandingRequest?)
+  typealias OutboundOut = ByteBuffer
+
+  func handlerAdded(context: ChannelHandlerContext) {
+    self.scratchBuffer = context.channel.allocator.buffer(capacity: 512)
+    self.jsonDecoder.userInfo[.responseTypeCallbackKey] = { id in
+      context.eventLoop.preconditionInEventLoop()
+      guard let outstanding = self.outstandingRequests[id] else {
+        log("Unknown request for \(id)", level: .error)
+        return nil
+      }
+      return outstanding.responseType
+    } as JSONRPCMessage.ResponseTypeCallback
+  }
+
+  func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+    var bytes = unwrapInboundIn(data)
+    let data = bytes.readData(length: bytes.readableBytes)!
+    do {
+      let message = try jsonDecoder.decode(JSONRPCMessage.self, from: data)
+      let result: LSPResult<Any>
+      let requestID: RequestID
+
+      switch message {
+        case .errorResponse(let error, id: let id):
+          result = .failure(error)
+          requestID = id
+        case .response(let value, id: let id):
+          result = .success(value)
+          requestID = id
+        default:
+          handlerQueue.async {
+            self.messageHandler(message)
+          }
+          return
+      }
+
+      guard let outstanding = outstandingRequests.removeValue(forKey: requestID) else {
+        log("Unknown request for \(requestID)", level: .error)
+        return
+      }
+
+      outstanding.promise.succeed(result)
+
+    } catch {
+      self.errorCaught(context: context, error: error)   
+    }
+  }
+
+  func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+    let (message, replyInfo) = self.unwrapOutboundIn(data)
+    if case .request(_, let id) = message {
+      precondition(outstandingRequests[id] == nil)
+      outstandingRequests[id] = replyInfo!
+    }
+    writeImpl(context: context, message: message, promise: promise)
+  }
+
+  func writeImpl(context: ChannelHandlerContext, message: JSONRPCMessage, promise: EventLoopPromise<Void>?) {
+    do {
+      let data = try jsonEncoder.encode(message)
+      scratchBuffer.reserveCapacity(data.count)
+      scratchBuffer.clear()
+      scratchBuffer.writeBytes(data)
+      context.write(self.wrapOutboundOut(scratchBuffer), promise: promise)
+    } catch {
+      // If anything goes wrong, tell the `Channel` and fail the write promise.
+      context.fireErrorCaught(error)
+      promise?.fail(error)
+    }
+  }
+
+  // FIXME: when can this happen?
+  func channelInactive(context: ChannelHandlerContext) {
+    outstandingRequests.forEach { _, outstanding in
+      outstanding.promise.succeed(.failure(.cancelled))
+    }
+    outstandingRequests.removeAll()
+  }
+
+  func errorCaught(context: ChannelHandlerContext, error: Error) {
+    if let error = error as? MessageDecodingError {
+      // FIXME: for errors like parseError, or invalidRequest should we just give up?
+      switch (error.messageKind, error.id) {
+        case (.request, let id?):
+          // Send failure as response to client.
+          writeImpl(
+            context: context,
+            message: .errorResponse(ResponseError(error), id: id),
+            promise: nil)
+          context.flush()
+          return
+        case (.response, let id?):
+          if let replyInfo = outstandingRequests.removeValue(forKey: id) {
+            // Send failure as response to outstanding request.
+            replyInfo.promise.succeed(.failure(ResponseError(error)))
+          } else {
+            log("error in response to unknown request \(id) \(error)", level: .error)
+          }
+          return
+        case (.notification, _):
+          if error.code == .methodNotFound {
+            log("ignoring unknown notification \(error)")
+            return
+          }
+        default:
+          break
+      }
+    }
+
+    // Fatal error: report and then close the connection.
+    handlerQueue.async {
+      self.errorHandler(error)
+    }
+    context.close(promise: nil)
+  }
+}
 
 /// A connection between a message handler (e.g. language server) in the same process as the connection object and a remote message handler (e.g. language client) that may run in another process using JSON RPC messages sent over a pair of in/out file descriptors.
 ///
 /// For example, inside a language server, the `JSONRPCConnection` takes the language service implemenation as its `receiveHandler` and itself provides the client connection for sending notifications and callbacks.
 public final class JSONRPCConection {
 
+  let group: EventLoopGroup
+  var channel: Channel? = nil
+  let inFD: CInt
+  let outFD: CInt
+
   var receiveHandler: MessageHandler? = nil
   let queue: DispatchQueue = DispatchQueue(label: "jsonrpc-queue", qos: .userInitiated)
-  let sendQueue: DispatchQueue = DispatchQueue(label: "jsonrpc-send-queue", qos: .userInitiated)
-  let receiveIO: DispatchIO
-  let sendIO: DispatchIO
   let messageRegistry: MessageRegistry
 
   /// *For Testing* Whether to wait for requests to finish before handling the next message.
@@ -37,21 +193,7 @@ public final class JSONRPCConection {
   /// Current state of the connection, used to ensure correct usage.
   var state: State
 
-  /// *Public for testing* Buffer of received bytes that haven't been parsed.
-  public var _requestBuffer: [UInt8] = []
-
   private var _nextRequestID: Int = 0
-
-  struct OutstandingRequest {
-    var requestType: _RequestType.Type
-    var responseType: ResponseType.Type
-    var queue: DispatchQueue
-    var replyHandler: (LSPResult<Any>) -> Void
-  }
-
-  /// The set of currently outstanding outgoing requests along with information about how to decode and handle their responses.
-  var outstandingRequests: [RequestID: OutstandingRequest] = [:]
-
   var closeHandler: () -> Void
 
   public init(
@@ -62,28 +204,12 @@ public final class JSONRPCConection {
     closeHandler: @escaping () -> Void = {})
   {
     state = .created
+    self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    self.inFD = inFD
+    self.outFD = outFD
     self.closeHandler = closeHandler
     self.messageRegistry = messageRegistry
     self.syncRequests = syncRequests
-
-    receiveIO = DispatchIO(type: .stream, fileDescriptor: inFD, queue: queue) { (error: Int32) in
-      if error != 0 {
-        log("IO error \(error)", level: .error)
-      }
-    }
-
-    sendIO = DispatchIO(type: .stream, fileDescriptor: outFD, queue: sendQueue) { (error: Int32) in
-      if error != 0 {
-        log("IO error \(error)", level: .error)
-      }
-    }
-
-    // We cannot assume the client will send us bytes in packets of any particular size, so set the lower limit to 1.
-    receiveIO.setLimit(lowWater: 1)
-    receiveIO.setLimit(highWater: Int.max)
-
-    sendIO.setLimit(lowWater: 1)
-    sendIO.setLimit(highWater: Int.max)
   }
 
   deinit {
@@ -98,38 +224,45 @@ public final class JSONRPCConection {
     state = .running
     self.receiveHandler = receiveHandler
 
-    receiveIO.read(offset: 0, length: Int.max, queue: queue) { done, data, errorCode in
-      guard errorCode == 0 else {
-        log("IO error \(errorCode)", level: .error)
-        if done { self._close() }
-        return
+    // FIXME: error handling?
+    self.channel = try! PipeBootstrap(group: group)
+      .channelOption(ChannelOptions.allowRemoteHalfClosure, value: false)
+      .channelInitializer { channel in
+        channel.pipeline.addHandlers([
+          ByteToMessageHandler(NIOJSONRPCFraming.ContentLengthHeaderFrameDecoder()),
+          NIOJSONRPCFraming.ContentLengthHeaderFrameEncoder(),
+          // DebugInboundEventsHandler { event, context in
+          //   let message: String
+          //   switch event {
+          //   case .registered:
+          //       message = "Channel registered"
+          //   case .unregistered:
+          //       message = "Channel unregistered"
+          //   case .active:
+          //       message = "Channel became active"
+          //   case .inactive:
+          //       message = "Channel became inactive"
+          //   case .read(let data):
+          //       message = "Channel read \(data)"
+          //   case .readComplete:
+          //       message = "Channel completed reading"
+          //   case .writabilityChanged(let isWritable):
+          //       message = "Channel writability changed to \(isWritable)"
+          //   case .userInboundEventTriggered(let event):
+          //       message = "Channel user inbound event \(event) triggered"
+          //   case .errorCaught(let error):
+          //       message = "Channel caught error: \(error)"
+          //   }
+          //   log(message + " in \(context.name)", level: .error)
+          // },
+          JSONRPCConnectionBridge(
+            protocol: self.messageRegistry,
+            messageHandler: self.handle(_:),
+            errorHandler: { error in log("IO error \(type(of: error))", level: .error) },
+            handlerQueue: self.queue),
+        ])
       }
-
-      if done {
-        self._close()
-        return
-      }
-
-      guard let data = data, !data.isEmpty else {
-        return
-      }
-
-      // Parse and handle any messages in `buffer + data`, leaving any remaining unparsed bytes in `buffer`.
-      if self._requestBuffer.isEmpty {
-        data.withUnsafeBytes { (pointer: UnsafePointer<UInt8>) in
-          let rest = self.parseAndHandleMessages(from: UnsafeBufferPointer(start: pointer, count: data.count))
-          self._requestBuffer.append(contentsOf: rest)
-        }
-      } else {
-        self._requestBuffer.append(contentsOf: data)
-        var unused = 0
-        self._requestBuffer.withUnsafeBufferPointer { buffer in
-          let rest = self.parseAndHandleMessages(from: buffer)
-          unused = rest.count
-        }
-        self._requestBuffer.removeFirst(self._requestBuffer.count - unused)
-      }
-    }
+      .withPipes(inputDescriptor: inFD, outputDescriptor: outFD).wait()
   }
 
   /// Whether we can send messages in the current state.
@@ -144,139 +277,30 @@ public final class JSONRPCConection {
     return ready
   }
 
-  /// Parse and handle all messages in `bytes`, returning a slice containing any remaining incomplete data.
-  func parseAndHandleMessages(from bytes: UnsafeBufferPointer<UInt8>) -> UnsafeBufferPointer<UInt8>.SubSequence {
-
-    let decoder = JSONDecoder()
-
-    // Set message registry to use for model decoding.
-    decoder.userInfo[.messageRegistryKey] = messageRegistry
-
-    // Setup callback for response type.
-    decoder.userInfo[.responseTypeCallbackKey] = { id in
-      guard let outstanding = self.outstandingRequests[id] else {
-        log("Unknown request for \(id)", level: .error)
-        return nil
-      }
-      return outstanding.responseType
-    } as JSONRPCMessage.ResponseTypeCallback
-
-    var bytes = bytes[...]
-
-    MESSAGE_LOOP: while true {
-      do {
-        guard let ((messageBytes, _), rest) = try bytes.jsonrpcSplitMessage() else {
-          return bytes
-        }
-        bytes = rest
-
-        let pointer = UnsafeMutableRawPointer(mutating: UnsafeBufferPointer(rebasing: messageBytes).baseAddress!)
-        let message = try decoder.decode(JSONRPCMessage.self, from: Data(bytesNoCopy: pointer, count: messageBytes.count, deallocator: .none))
-
-        handle(message)
-
-      } catch let error as MessageDecodingError {
-
-        switch error.messageKind {
-          case .request:
-            if let id = error.id {
-              send { encoder in
-                try encoder.encode(JSONRPCMessage.errorResponse(ResponseError(error), id: id))
-              }
-              continue MESSAGE_LOOP
-            }
-          case .response:
-            if let id = error.id {
-              if let outstanding = self.outstandingRequests.removeValue(forKey: id) {
-                outstanding.replyHandler(.failure(ResponseError(error)))
-              } else {
-                log("error in response to unknown request \(id) \(error)", level: .error)
-              }
-              continue MESSAGE_LOOP
-            }
-          case .notification:
-            if error.code == .methodNotFound {
-              log("ignoring unknown notification \(error)")
-              continue MESSAGE_LOOP
-            }
-          case .unknown:
-            break
-        }
-        // FIXME: graceful shutdown?
-        fatalError("fatal error encountered decoding message \(error)")
-
-      } catch {
-        // FIXME: graceful shutdown?
-        fatalError("fatal error encountered decoding message \(error)")
-      }
-    }
-  }
-
-  /// Handle a single message by dispatching it to `receiveHandler` or an appropriate reply handler.
+  /// Handle a single message by dispatching it to `receiveHandler`.
   func handle(_ message: JSONRPCMessage) {
     switch message {
     case .notification(let notification):
       notification._handle(receiveHandler!, connection: self)
     case .request(let request, id: let id):
       request._handle(receiveHandler!, id: id, connection: self, sync: syncRequests)
-    case .response(let response, id: let id):
-      guard let outstanding = outstandingRequests.removeValue(forKey: id) else {
-        log("Unknown request for \(id)", level: .error)
-        return
-      }
-      outstanding.replyHandler(.success(response))
-    case .errorResponse(let error, id: let id):
-      guard let outstanding = outstandingRequests.removeValue(forKey: id) else {
-        log("Unknown request for \(id)", level: .error)
-        return
-      }
-      outstanding.replyHandler(.failure(error))
+    case .response, .errorResponse:
+      fatalError("handled by \(JSONRPCConnectionBridge.self)")
     }
   }
 
-  /// *Public for testing*.
-  public func send(_rawData dispatchData: DispatchData) {
-    guard readyToSend() else { return }
+  func send(message: JSONRPCMessage, replyInfo: OutstandingRequest? = nil) {
+    guard readyToSend(), let channel = self.channel else { return }
 
-    sendIO.write(offset: 0, data: dispatchData, queue: sendQueue) { [weak self] done, _, errorCode in
-      if errorCode != 0 {
-        log("IO error sending message \(errorCode)", level: .error)
-        if done {
-          self?.close()
-        }
+    channel.writeAndFlush((message, replyInfo)).whenFailure { error in
+      switch error {
+        case ChannelError.ioOnClosedChannel:
+          // FIXME: is this the right way to handle it?
+          replyInfo?.promise.succeed(.failure(ResponseError.cancelled))
+        default:
+          replyInfo?.promise.succeed(.failure(ResponseError.unknown("\(error)")))
       }
     }
-  }
-
-  func send(messageData: Data) {
-
-    var dispatchData = DispatchData.empty
-    let header = "Content-Length: \(messageData.count)\r\n\r\n"
-    header.utf8.map{$0}.withUnsafeBytes { buffer in
-      dispatchData.append(buffer)
-    }
-    messageData.withUnsafeBytes { rawBufferPointer in
-      dispatchData.append(rawBufferPointer)
-    }
-
-    send(_rawData: dispatchData)
-  }
-
-  func send(encoding: (JSONEncoder) throws -> Data) {
-    guard readyToSend() else { return }
-
-    let encoder = JSONEncoder()
-
-    let data: Data
-    do {
-      data = try encoding(encoder)
-
-    } catch {
-      // FIXME: attempt recovery?
-      fatalError("unexpected error while encoding response: \(error)")
-    }
-
-    send(messageData: data)
   }
 
   /// Close the connection.
@@ -289,9 +313,15 @@ public final class JSONRPCConection {
     guard state == .running else { return }
 
     log("\(JSONRPCConection.self): closing...")
-    receiveIO.close(flags: .stop)
-    sendIO.close(flags: .stop)
     state = .closed
+    do {
+      try self.channel?.close().wait()
+    } catch ChannelError.alreadyClosed {
+      // Okay.
+    } catch {
+      // FIXME: log and ignore?
+      fatalError("could not close channel: \(error)")
+    }
     receiveHandler = nil // break retain cycle
     closeHandler()
   }
@@ -301,58 +331,54 @@ public final class JSONRPCConection {
     _nextRequestID += 1
     return .number(_nextRequestID)
   }
-
 }
 
 extension JSONRPCConection: _IndirectConnection {
   // MARK: Connection interface
 
-  public func send<Notification>(_ notification: Notification) where Notification: NotificationType {
+  public func send<Notification: NotificationType>(_ notification: Notification) {
     guard readyToSend() else { return }
-    send { encoder in
-      return try encoder.encode(JSONRPCMessage.notification(notification))
-    }
+    send(message: .notification(notification))
   }
 
-  public func send<Request>(_ request: Request, queue: DispatchQueue, reply: @escaping (LSPResult<Request.Response>) -> Void) -> RequestID where Request: RequestType {
+  public func send<Request: RequestType>(
+    _ request: Request,
+    queue: DispatchQueue,
+    reply: @escaping (LSPResult<Request.Response>) -> Void
+  ) -> RequestID {
 
-    let id: RequestID = self.queue.sync {
-      let id = nextRequestID()
+    let id: RequestID = self.queue.sync { nextRequestID() }
 
-      guard readyToSend() else {
+    guard let channel = self.channel else {
+      queue.async {
         reply(.failure(.cancelled))
-        return id
       }
-
-      outstandingRequests[id] = OutstandingRequest(
-        requestType: Request.self,
-        responseType: Request.Response.self,
-        queue: queue,
-        replyHandler: { anyResult in
-          queue.async {
-            reply(anyResult.map { $0 as! Request.Response })
-          }
-      })
       return id
     }
 
-    send { encoder in
-      return try encoder.encode(JSONRPCMessage.request(request, id: id))
-    }
+    let promise = channel.eventLoop.makePromise(of: LSPResult<Any>.self)
+    promise.futureResult
+      .recover { error in
+        // FIXME: error handling?
+        fatalError("error \(error)")
+      }
+      .whenSuccess { anyResult in
+        queue.async {
+          reply(anyResult.map { $0 as! Request.Response })
+        }
+      }
 
+    self.send(message: .request(request, id: id), replyInfo: OutstandingRequest(promise: promise, responseType: Request.Response.self))
     return id
   }
 
   public func sendReply<Response>(_ response: LSPResult<Response>, id: RequestID) where Response: ResponseType {
     guard readyToSend() else { return }
-
-    send { encoder in
-      switch response {
+    switch response {
       case .success(let result):
-        return try encoder.encode(JSONRPCMessage.response(result, id: id))
+        self.send(message: .response(result, id: id))
       case .failure(let error):
-        return try encoder.encode(JSONRPCMessage.errorResponse(error, id: id))
-      }
+        self.send(message: .errorResponse(error, id: id))
     }
   }
 }
